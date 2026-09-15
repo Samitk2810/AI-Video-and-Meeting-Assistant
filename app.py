@@ -3,6 +3,8 @@ import os
 import tempfile
 from pathlib import Path
 
+import requests
+
 from dotenv import load_dotenv
 import streamlit as st
 
@@ -140,53 +142,37 @@ def _meeting_export(meeting: dict) -> str:
 	return "\n\n".join(sections)
 
 
-def _run_full_pipeline(source: str, language: str) -> dict:
-	from core.extractor import extract_all
-	from core.summarize import generate_title, summarize
-	from core.transcriber import transcribe_all
-	from utils.audio_processor import process_input
-
-	transcript = transcribe_all(process_input(source), language=language)
-	summary = summarize(transcript)
-	extracted = extract_all(transcript)
-	return {
-		"title": generate_title(summary),
-		"summary": summary,
-		"action_items": extracted["action_items"],
-		"decisions": extracted["decisions"],
-		"questions": extracted["questions"],
-		"transcript": transcript,
-	}
+FASTAPI_URL = os.getenv("FASTAPI_URL", "http://127.0.0.1:8000")
 
 
-def _run_brief_pipeline(source: str, language: str) -> dict:
-	from core.summarize import generate_title, summarize
-	from core.transcriber import transcribe_all
-	from utils.audio_processor import process_input
-
-	transcript = transcribe_all(process_input(source), language=language)
-	summary = summarize(transcript)
-	return {
-		"title": generate_title(summary),
-		"summary": summary,
-		"action_items": [],
-		"decisions": [],
-		"questions": [],
-		"transcript": transcript,
-	}
+def _analyze_with_api(source: str, language: str) -> dict:
+	response = requests.post(
+		f"{FASTAPI_URL}/analyze",
+		json={"source": source, "language": language},
+		timeout=1800,
+	)
+	if not response.ok:
+		try:
+			detail = response.json().get("detail", response.text)
+		except Exception:
+			detail = response.text
+		raise RuntimeError(str(detail))
+	return response.json()
 
 
-@st.cache_resource(show_spinner=False)
-def _build_cached_rag_chain(transcript: str):
-	from core.rag_engine import build_rag_chain
-
-	return build_rag_chain(transcript)
-
-
-def _ask_question(rag_chain, question: str):
-	from core.rag_engine import ask_question
-
-	return ask_question(rag_chain, question)
+def _ask_with_api(analysis_id: str, question: str) -> str:
+	response = requests.post(
+		f"{FASTAPI_URL}/analyses/{analysis_id}/ask",
+		json={"question": question},
+		timeout=300,
+	)
+	if not response.ok:
+		try:
+			detail = response.json().get("detail", response.text)
+		except Exception:
+			detail = response.text
+		raise RuntimeError(str(detail))
+	return str(response.json().get("answer", ""))
 
 
 def _format_analysis_error(error: Exception) -> str:
@@ -194,9 +180,11 @@ def _format_analysis_error(error: Exception) -> str:
 	if "503" in message or "upstream" in message or "overflow" in message:
 		return "Mistral temporarily reset the analysis request. No RAG database was involved. Please click Analyze again in a moment; if it repeats, try a shorter recording or check Mistral service status."
 	if "401" in message or "Invalid API Key" in message:
-		return "Mistral rejected the API key. Update MISTRAL_API_KEY in the project .env file with a current key, then restart Streamlit."
+		return "Mistral rejected the API key. Update MISTRAL_API_KEY in the project .env file with a current key, then restart FastAPI."
 	if "MISTRAL_API_KEY" in message or "API key" in message:
-		return "MISTRAL_API_KEY is missing. Add it to the project .env file, then restart Streamlit."
+		return "MISTRAL_API_KEY is missing. Add it to the project .env file, then restart FastAPI."
+	if "Connection refused" in message or "Failed to establish a new connection" in message:
+		return f"Could not connect to FastAPI at {FASTAPI_URL}. Start the FastAPI server and try again."
 	return f"Analysis could not be completed: {message}"
 
 
@@ -205,7 +193,9 @@ def _format_chat_error(error: Exception) -> str:
 	if "503" in message or "upstream" in message or "overflow" in message:
 		return "Mistral is temporarily unavailable for this request. Please try the question again in a moment. If it keeps happening, ask a shorter question."
 	if "401" in message or "Invalid API Key" in message:
-		return "Mistral rejected the API key. Update MISTRAL_API_KEY in .env and restart Streamlit."
+		return "Mistral rejected the API key. Update MISTRAL_API_KEY in .env and restart FastAPI."
+	if "Connection refused" in message or "Failed to establish a new connection" in message:
+		return f"Could not connect to FastAPI at {FASTAPI_URL}. Start the FastAPI server and try again."
 	return f"I could not answer that right now: {message}"
 
 
@@ -252,10 +242,7 @@ if analyze:
 		try:
 			with st.status("Building your brief", expanded=True) as status:
 				st.write("Extracting audio…")
-				if input_mode == "Meeting audio":
-					meeting = _run_full_pipeline(source.strip(), language)
-				else:
-					meeting = _run_brief_pipeline(source.strip(), language)
+				meeting = _analyze_with_api(source.strip(), language)
 				meeting["full_brief"] = input_mode == "Meeting audio"
 				status.update(label="Brief ready", state="complete", expanded=False)
 			st.session_state.meeting = meeting
@@ -323,9 +310,7 @@ else:
 			with st.chat_message("assistant"):
 				with st.spinner("Searching the conversation"):
 					try:
-						if "rag_chain" not in meeting:
-							meeting["rag_chain"] = _build_cached_rag_chain(meeting["transcript"])
-						answer = _ask_question(meeting["rag_chain"], question)
+						answer = _ask_with_api(meeting["analysis_id"], question)
 					except Exception as error:
 						answer = _format_chat_error(error)
 				st.markdown(answer)
